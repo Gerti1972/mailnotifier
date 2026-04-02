@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+
+    <!-- Hintergrund: tiefes Blau-Verlauf -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+
+    <!-- Umschlag-Füllung: weiß mit leichtem Blau-Ton -->
+    <linearGradient id="envGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#bfdbfe"/>
+    </linearGradient>
+
+    <!-- Weicher Schatten für den Umschlag -->
+    <filter id="envShadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4"
+                    flood-color="#00000040"/>
+    </filter>
+
+    <!-- Äußerer Glanz-Ring -->
+    <radialGradient id="gloss" cx="40%" cy="25%" r="60%">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.00"/>
+    </radialGradient>
+
+  </defs>
+
+  <!-- ── Hintergrund-Kreis ─────────────────────────── -->
+  <rect x="4" y="4" width="120" height="120"
+        rx="28" ry="28"
+        fill="url(#bgGrad)"/>
+
+  <!-- Glanz-Overlay -->
+  <rect x="4" y="4" width="120" height="120"
+        rx="28" ry="28"
+        fill="url(#gloss)"/>
+
+  <!-- ── Umschlag-Körper ───────────────────────────── -->
+  <rect x="18" y="38" width="92" height="60"
+        rx="8" ry="8"
+        fill="url(#envGrad)"
+        filter="url(#envShadow)"/>
+
+  <!-- ── Umschlag-Klappe (V-Form) ─────────────────── -->
+  <!--  Ausgefülltes Dreieck als Klappe (Hintergrund) -->
+  <polygon
+    points="18,38 64,76 110,38"
+    fill="#93c5fd"
+    opacity="0.5"/>
+
+  <!--  Klappenrand (scharfe Linie) -->
+  <polyline
+    points="18,38 64,76 110,38"
+    fill="none"
+    stroke="white"
+    stroke-width="3.5"
+    stroke-linejoin="round"
+    stroke-linecap="round"/>
+
+  <!-- ── Untere Seiten-Falze ───────────────────────── -->
+  <line x1="18"  y1="98" x2="48" y2="68"
+        stroke="white" stroke-width="2"
+        stroke-linecap="round" stroke-opacity="0.5"/>
+  <line x1="110" y1="98" x2="80" y2="68"
+        stroke="white" stroke-width="2"
+        stroke-linecap="round" stroke-opacity="0.5"/>
+
+  <!-- ── Linienpapier im Umschlag (Tiefe/Detail) ───── -->
+  <line x1="38" y1="82" x2="90" y2="82"
+        stroke="#93c5fd" stroke-width="2"
+        stroke-linecap="round" stroke-opacity="0.6"/>
+  <line x1="38" y1="89" x2="76" y2="89"
+        stroke="#93c5fd" stroke-width="2"
+        stroke-linecap="round" stroke-opacity="0.4"/>
+
+</svg>

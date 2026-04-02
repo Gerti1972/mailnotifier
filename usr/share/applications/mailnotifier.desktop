@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Mail Notifier
+Comment=IMAP Mail-Prüfer im Systemtray
+Exec=mailnotifier
+Icon=mailnotifier
+Terminal=false
+Categories=Network;Email;Utility;
+Keywords=mail;imap;notify;email;
+StartupNotify=false

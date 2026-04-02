@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mail Notifier
+Comment=IMAP Mail Checker Autostart
+Exec=mailnotifier
+Icon=mailnotifier
+Terminal=false
+X-GNOME-Autostart-enabled=true
