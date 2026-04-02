@@ -35,3 +35,6 @@ Mit einem Klick auf **Jetzt prüfen** kannst du sofort testen, ob die Verbindung
 
 ### Neue E‑Mails vorhanden  
 <img width="26" height="21" alt="mail" src="https://github.com/user-attachments/assets/6308e5d8-076b-4b38-a624-c57000dd1886" />
+
+### 5. Verknüpftes Mailprogramm öffnen  
+Mit einem Linksklick auf das Systray-Icon öffnet sich Dein Mailprogramm (wenn in den Einstellungen entsprechen angegeben).
