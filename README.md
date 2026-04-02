@@ -13,17 +13,11 @@ Mailnotifier ist ein leichtgewichtiges Tool, das deinen Posteingang automatisch 
 Nach dem Start findest du das Mailnotifier‑Icon im Systray.  
 Mit einem Rechtsklick öffnest du das Kontextmenü und wählst **Einstellungen**.
 
-### 2. Mail‑Account einrichten  
-Trage deine Zugangsdaten für dein E‑Mail‑Konto ein:
+### 2. Mail‑Account einrichten und Programmoptionen festlegen
+Trage deine Zugangsdaten für dein E‑Mail‑Konto ein, wähle das gewünschte Aktualisierungsintervall und entscheide, ob Mailnotifier automatisch beim Systemstart geladen werden soll (empfohlen):
+<img width="500" height="552" alt="prgsettings" src="https://github.com/user-attachments/assets/fe13daf1-018e-4214-a9be-0ec657f29a72" />
 
-<img width="440" height="532" alt="mailsettings" src="https://github.com/user-attachments/assets/9e5eba6f-298f-47d2-b8a9-7727f037876d" />
-
-### 3. Programmoptionen festlegen  
-Wähle das gewünschte Aktualisierungsintervall und entscheide, ob Mailnotifier automatisch beim Systemstart geladen werden soll (empfohlen):
-
-<img width="440" height="532" alt="prgsettings" src="https://github.com/user-attachments/assets/fad89cff-be82-4467-8932-89a3014f0c53" />
-
-### 4. Testlauf  
+### 3. Testlauf  
 Mit einem Klick auf **Jetzt prüfen** kannst du sofort testen, ob die Verbindung funktioniert.
 
 ---
@@ -36,5 +30,5 @@ Mit einem Klick auf **Jetzt prüfen** kannst du sofort testen, ob die Verbindung
 ### Neue E‑Mails vorhanden  
 <img width="26" height="21" alt="mail" src="https://github.com/user-attachments/assets/6308e5d8-076b-4b38-a624-c57000dd1886" />
 
-### 5. Verknüpftes Mailprogramm öffnen  
+### 4. Verknüpftes Mailprogramm öffnen  
 Mit einem Linksklick auf das Systray-Icon öffnet sich Dein Mailprogramm (wenn in den Einstellungen entsprechen angegeben).
