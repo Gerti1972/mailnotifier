@@ -3,8 +3,7 @@ Ein schlanker und eleganter Mail‑Notifier für den Linux‑Systray
 
 <img width="128" height="128" alt="mailnotifier" src="https://github.com/user-attachments/assets/da86b3c7-df74-4474-9838-7fd0ec85bb07" />
 
-Mailnotifier ist ein leichtgewichtiges Tool, das deinen Posteingang automatisch überwacht und neue E‑Mails direkt im Systray anzeigt.  
-Das Programm steht als **Debian‑Paket** zur einfachen Installation bereit.
+Mailnotifier ist ein leichtgewichtiges Tool, das deinen Posteingang automatisch überwacht und neue E‑Mails direkt im Systray anzeigt.  Das Programm steht als **Debian‑Paket** zur einfachen Installation bereit.
 
 ---
 
