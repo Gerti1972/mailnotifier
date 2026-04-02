@@ -1,4 +1,4 @@
-# Mailnotifier  
+# Mailnotifier 1.2
 Ein schlanker und eleganter Mail‑Notifier für den Linux‑Systray
 
 <img width="128" height="128" alt="mailnotifier" src="https://github.com/user-attachments/assets/da86b3c7-df74-4474-9838-7fd0ec85bb07" />
