@@ -1,496 +1,761 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-MailNotifier – Linux Mint Taskleisten-Mail-Checker
-Version: 2.0  (StatusIcon – echte Links/Rechtsklick-Trennung)
+mailnotifier.py — Secure IMAP Mail Notifier for Linux Mint / Cinnamon
 """
 
 import gi
-gi.require_version('Gtk', '3.0')
-gi.require_version('Notify', '0.7')
+gi.require_version("Gtk", "3.0")
 
-from gi.repository import Gtk, GdkPixbuf, Notify, GLib
+from gi.repository import Gtk, GLib
 import imaplib
+import subprocess
 import threading
 import configparser
 import os
-import subprocess
+import re
+import shlex
+import socket
+import sys
 import logging
 from pathlib import Path
 
-# ──────────────────────────────────────────────
-# Pfade & Konstanten
-# ──────────────────────────────────────────────
-APP_ID        = "mailnotifier"
-APP_NAME      = "Mail Notifier"
-BASE_DIR      = Path.home() / ".local/share/mailnotifier"
-CONFIG_FILE   = Path.home() / ".config/mailnotifier.ini"
-AUTOSTART_DIR = Path.home() / ".config/autostart"
-AUTOSTART_FILE = AUTOSTART_DIR / "mailnotifier.desktop"
-ICON_GREY     = str(BASE_DIR / "icon_grey.svg")
-ICON_BLUE     = str(BASE_DIR / "icon_blue.svg")
-SCRIPT_PATH   = str(BASE_DIR / "mailnotifier.py")
+# ── SecretService (GNOME Keyring) ────────────────────────────────────────────
+try:
+    import secretstorage
+    SECRETSTORAGE_AVAILABLE = True
+except ImportError:
+    SECRETSTORAGE_AVAILABLE = False
+
+# ── Konstanten ────────────────────────────────────────────────────────────────
+CONFIG_DIR             = Path.home() / ".config" / "mailnotifier"
+CONFIG_FILE            = CONFIG_DIR  / "mailnotifier.ini"
+LOG_DIR                = Path.home() / ".local" / "share" / "mailnotifier"
+ICON_DIR               = Path("/usr/share/mailnotifier")
+ICON_GREY              = str(ICON_DIR / "icon_grey.svg")
+ICON_BLUE              = str(ICON_DIR / "icon_blue.svg")
+KEYRING_SERVICE        = "mailnotifier"
+KEYRING_KEY_PASSWORD   = "imap_password"
+KEYRING_KEY_MAILCLIENT = "mail_client"
+IMAP_TIMEOUT           = 15
+AUTOSTART_FILE         = Path.home() / ".config" / "autostart" / "mailnotifier.desktop"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+os.chmod(LOG_DIR, 0o700)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "mailnotifier.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
-log = logging.getLogger(APP_NAME)
+log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Konfiguration
-# ──────────────────────────────────────────────
-class Config:
-    DEFAULTS = {
-        "imap_server":   "",
-        "imap_port":     "993",
-        "imap_user":     "",
-        "imap_password": "",
-        "imap_ssl":      "true",
-        "imap_folder":   "INBOX",
-        "interval":      "5",
-        "mail_client":   "",
-        "autostart":     "true",
-    }
 
-    def __init__(self):
-        self.cfg = configparser.ConfigParser()
-        self.cfg["settings"] = self.DEFAULTS.copy()
-        self.load()
+# ══════════════════════════════════════════════════════════════════════════════
+# EINGABEVALIDIERUNG
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def load(self):
-        if CONFIG_FILE.exists():
-            self.cfg.read(CONFIG_FILE)
-
-    def save(self):
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, "w") as f:
-            self.cfg.write(f)
-
-    def get(self, key):
-        return self.cfg.get("settings", key, fallback=self.DEFAULTS.get(key, ""))
-
-    def set(self, key, value):
-        self.cfg.set("settings", key, str(value))
-
-    @property
-    def autostart_enabled(self):
-        return self.get("autostart").lower() == "true"
-
-    @property
-    def interval_seconds(self):
-        try:
-            return max(1, int(self.get("interval"))) * 60
-        except ValueError:
-            return 300
-
-# ──────────────────────────────────────────────
-# Autostart
-# ──────────────────────────────────────────────
-DESKTOP_CONTENT = """\
-[Desktop Entry]
-Type=Application
-Name=Mail Notifier
-Comment=IMAP Mail Checker
-Exec=python3 {script}
-Icon={icon}
-Terminal=false
-Categories=Utility;Network;Email;
-StartupNotify=false
-X-GNOME-Autostart-enabled=true
-"""
-
-def enable_autostart():
-    AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-    AUTOSTART_FILE.write_text(
-        DESKTOP_CONTENT.format(script=SCRIPT_PATH, icon=ICON_GREY)
+def validate_hostname(hostname: str) -> bool:
+    if not hostname or len(hostname) > 253:
+        return False
+    try:
+        socket.inet_aton(hostname)
+        return True
+    except socket.error:
+        pass
+    pattern = re.compile(
+        r"^(?:[a-zA-Z0-9]"
+        r"(?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+"
+        r"[a-zA-Z]{2,}$"
     )
-    log.info("Autostart aktiviert")
+    return bool(pattern.match(hostname))
 
-def disable_autostart():
-    if AUTOSTART_FILE.exists():
-        AUTOSTART_FILE.unlink()
-    log.info("Autostart deaktiviert")
 
-# ──────────────────────────────────────────────
-# IMAP-Checker
-# ──────────────────────────────────────────────
-class IMAPChecker:
-    def __init__(self, config: Config):
-        self.config       = config
-        self._last_uids: set = set()
-        self._initialized = False
+def validate_port(port_value) -> int:
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Port ist keine Zahl: {port_value!r}")
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Port außerhalb des gültigen Bereichs (1–65535): {port}")
+    return port
 
-    def check(self) -> int:
-        server   = self.config.get("imap_server")
-        port     = int(self.config.get("imap_port"))
-        user     = self.config.get("imap_user")
-        password = self.config.get("imap_password")
-        use_ssl  = self.config.get("imap_ssl").lower() == "true"
-        folder   = self.config.get("imap_folder") or "INBOX"
 
-        if not server or not user or not password:
-            log.warning("IMAP-Zugangsdaten unvollständig")
-            return 0
+def validate_folder(folder: str) -> bool:
+    if not folder or len(folder) > 255:
+        return False
+    forbidden = set(';\'"\\`$&|<>(){}!*?~^')
+    return not any(c in forbidden for c in folder)
 
+
+def validate_mail_client(client_path: str) -> list:
+    if not client_path or not client_path.strip():
+        raise ValueError("Kein Mail-Client-Pfad angegeben.")
+    try:
+        parts = shlex.split(client_path.strip())
+    except ValueError as e:
+        raise ValueError(f"Ungültiger Befehl (Syntaxfehler): {e}")
+    if not parts:
+        raise ValueError("Leerer Mail-Client-Befehl nach Parsing.")
+
+    executable = parts[0]
+
+    if os.path.isabs(executable):
+        if not os.path.isfile(executable):
+            raise ValueError(f"Programm nicht gefunden:\n{executable}")
+        if not os.access(executable, os.X_OK):
+            raise ValueError(f"Programm nicht ausführbar:\n{executable}")
+        return parts
+
+    result = subprocess.run(
+        ["which", executable], capture_output=True, text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError(
+            f"Programm '{executable}' nicht im PATH gefunden.\n"
+            "Bitte den vollständigen Pfad angeben."
+        )
+    return parts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASSWORT-VERWALTUNG — GNOME KEYRING
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PasswordManager:
+
+    @staticmethod
+    def _get_collection():
+        conn = secretstorage.dbus_init()
+        col  = secretstorage.get_default_collection(conn)
+        if col.is_locked():
+            col.unlock()
+        return col
+
+    @staticmethod
+    def save(key: str, value: str, label: str) -> None:
+        if not SECRETSTORAGE_AVAILABLE:
+            PasswordManager._fallback_warn()
+            return
         try:
-            conn = (imaplib.IMAP4_SSL(server, port)
-                    if use_ssl else imaplib.IMAP4(server, port))
-            conn.login(user, password)
-            conn.select(folder, readonly=True)
-            status, data = conn.uid("search", None, "ALL")
-            current_uids = set(data[0].split()) if data[0] else set()
-            conn.logout()
-
-            if not self._initialized:
-                self._last_uids   = current_uids
-                self._initialized = True
-                log.info(f"Baseline gesetzt: {len(current_uids)} Mails")
-                return 0
-
-            new_uids        = current_uids - self._last_uids
-            self._last_uids = current_uids
-            count = len(new_uids)
-            if count:
-                log.info(f"{count} neue Mail(s)")
-            return count
-
-        except imaplib.IMAP4.error as e:
-            log.error(f"IMAP-Fehler: {e}")
-            return 0
+            col = PasswordManager._get_collection()
+            col.create_item(
+                f"{KEYRING_SERVICE} — {label}",
+                {"service": KEYRING_SERVICE, "key": key},
+                value,
+                replace=True,
+            )
+            log.info(f"Keyring: '{label}' gespeichert.")
         except Exception as e:
-            log.error(f"Verbindungsfehler: {e}")
-            return 0
+            log.error(f"Keyring-Fehler beim Speichern von '{label}': {e}")
+            raise
 
-    def reset_baseline(self):
-        self._initialized = False
-
-# ──────────────────────────────────────────────
-# Einstellungsdialog
-# ──────────────────────────────────────────────
-class SettingsDialog(Gtk.Dialog):
-    def __init__(self, parent_app):
-        super().__init__(title="Mail Notifier – Einstellungen", flags=0)
-        self.app    = parent_app
-        self.config = parent_app.config
-        self.set_default_size(440, 500)
-        self.set_border_width(10)
-        self.set_resizable(False)
-
-        self.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
-        ok_btn = self.add_button("Speichern", Gtk.ResponseType.OK)
-        ok_btn.get_style_context().add_class("suggested-action")
-
-        box = self.get_content_area()
-        box.set_spacing(6)
-        notebook = Gtk.Notebook()
-        box.pack_start(notebook, True, True, 0)
-
-        # ── Tab IMAP ──────────────────────────
-        g = Gtk.Grid(column_spacing=12, row_spacing=10, border_width=16)
-        notebook.append_page(g, Gtk.Label(label="📧  IMAP"))
-
-        def lbl(text):
-            l = Gtk.Label(label=text, xalign=1.0)
-            l.get_style_context().add_class("dim-label")
-            return l
-
-        self.e_server = Gtk.Entry(
-            text=self.config.get("imap_server"),
-            placeholder_text="mail.example.com")
-        self.e_port   = Gtk.Entry(
-            text=self.config.get("imap_port"),
-            placeholder_text="993")
-        self.e_user   = Gtk.Entry(
-            text=self.config.get("imap_user"),
-            placeholder_text="benutzer@example.com")
-        self.e_pass   = Gtk.Entry(
-            text=self.config.get("imap_password"),
-            visibility=False)
-        self.e_pass.set_input_purpose(Gtk.InputPurpose.PASSWORD)
-        self.e_folder = Gtk.Entry(
-            text=self.config.get("imap_folder"),
-            placeholder_text="INBOX")
-        self.chk_ssl  = Gtk.CheckButton(label="SSL/TLS verwenden")
-        self.chk_ssl.set_active(
-            self.config.get("imap_ssl").lower() == "true")
-
-        for i, (label_text, widget) in enumerate([
-            ("Server:",   self.e_server),
-            ("Port:",     self.e_port),
-            ("Benutzer:", self.e_user),
-            ("Passwort:", self.e_pass),
-            ("Ordner:",   self.e_folder),
-        ]):
-            g.attach(lbl(label_text), 0, i, 1, 1)
-            g.attach(widget,          1, i, 2, 1)
-            widget.set_hexpand(True)
-
-        g.attach(self.chk_ssl, 1, 5, 2, 1)
-
-        btn_test = Gtk.Button(label="🔌  Verbindung testen")
-        btn_test.connect("clicked", self._on_test_connection)
-        g.attach(btn_test, 1, 6, 2, 1)
-
-        # ── Tab Allgemein ─────────────────────
-        g2 = Gtk.Grid(column_spacing=12, row_spacing=10, border_width=16)
-        notebook.append_page(g2, Gtk.Label(label="⚙  Allgemein"))
-
-        self.e_interval = Gtk.SpinButton.new_with_range(1, 120, 1)
+    @staticmethod
+    def load(key: str) -> str | None:
+        if not SECRETSTORAGE_AVAILABLE:
+            return None
         try:
-            self.e_interval.set_value(int(self.config.get("interval")))
-        except ValueError:
-            self.e_interval.set_value(5)
+            col   = PasswordManager._get_collection()
+            items = list(col.search_items(
+                {"service": KEYRING_SERVICE, "key": key}
+            ))
+            if items:
+                return items[0].get_secret().decode("utf-8")
+        except Exception as e:
+            log.error(f"Keyring-Fehler beim Laden von '{key}': {e}")
+        return None
 
-        self.e_client  = Gtk.Entry(
-            text=self.config.get("mail_client"),
-            placeholder_text="/usr/bin/thunderbird")
-        self.e_client.set_hexpand(True)
-        btn_browse = Gtk.Button(label="📂")
-        btn_browse.connect("clicked", self._on_browse_client)
+    @staticmethod
+    def delete(key: str) -> None:
+        if not SECRETSTORAGE_AVAILABLE:
+            return
+        try:
+            col = PasswordManager._get_collection()
+            for item in col.search_items(
+                {"service": KEYRING_SERVICE, "key": key}
+            ):
+                item.delete()
+            log.info(f"Keyring: '{key}' gelöscht.")
+        except Exception as e:
+            log.error(f"Keyring-Fehler beim Löschen von '{key}': {e}")
 
-        self.chk_autostart = Gtk.CheckButton(label="Autostart beim Login aktivieren")
-        self.chk_autostart.set_active(self.config.autostart_enabled)
+    @staticmethod
+    def _fallback_warn():
+        log.warning(
+            "secretstorage nicht verfügbar! "
+            "Bitte installieren: sudo apt install python3-secretstorage"
+        )
 
-        g2.attach(lbl("Intervall (Min):"), 0, 0, 1, 1)
-        g2.attach(self.e_interval,         1, 0, 2, 1)
-        g2.attach(lbl("Mail-Programm:"),   0, 1, 1, 1)
-        g2.attach(self.e_client,           1, 1, 1, 1)
-        g2.attach(btn_browse,              2, 1, 1, 1)
-        g2.attach(self.chk_autostart,      1, 2, 2, 1)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# KONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ensure_config_dir() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(LOG_DIR, 0o700)
+
+
+def load_config() -> configparser.ConfigParser:
+    ensure_config_dir()
+    config = configparser.ConfigParser()
+    if CONFIG_FILE.exists():
+        current_mode = oct(os.stat(CONFIG_FILE).st_mode)[-3:]
+        if current_mode not in ("600", "400"):
+            os.chmod(CONFIG_FILE, 0o600)
+        config.read(CONFIG_FILE)
+    if "IMAP" not in config:
+        config["IMAP"] = {
+            "server":         "",
+            "port":           "993",
+            "username":       "",
+            "folder":         "INBOX",
+            "check_interval": "5",
+            "autostart":      "true",
+        }
+    return config
+
+
+def save_config(config: configparser.ConfigParser) -> None:
+    ensure_config_dir()
+    for sensitive_key in ("password", "mail_client"):
+        if "IMAP" in config and sensitive_key in config["IMAP"]:
+            del config["IMAP"][sensitive_key]
+    with open(CONFIG_FILE, "w") as f:
+        config.write(f)
+    os.chmod(CONFIG_FILE, 0o600)
+    log.info("Konfiguration gespeichert (ohne sensible Daten).")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAP MAIL-CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_mail(config: configparser.ConfigParser) -> dict | None:
+    """
+    Verbindet sich per IMAP und gibt ein Dict zurück:
+      {
+        "new_count":  int,   # Anzahl Mails mit UID > last_known_uid
+        "total_unseen": int, # Gesamtzahl ungelesener Mails
+        "max_uid":    int,   # Höchste UID im UNSEEN-Set (zum Speichern)
+      }
+    Gibt None zurück bei Verbindungsfehlern.
+    """
+    cfg      = config["IMAP"]
+    server   = cfg.get("server",   "").strip()
+    username = cfg.get("username", "").strip()
+    folder   = cfg.get("folder",   "INBOX").strip()
+    password = PasswordManager.load(KEYRING_KEY_PASSWORD)
+
+    if not validate_hostname(server):
+        log.error(f"Ungültiger IMAP-Server: {server!r}")
+        return None
+    try:
+        port = validate_port(cfg.get("port", "993"))
+    except ValueError as e:
+        log.error(f"Port-Validierung: {e}")
+        return None
+    if not validate_folder(folder):
+        log.error(f"Ungültiger Ordnername: {folder!r}")
+        return None
+    if not username or not password:
+        log.warning("IMAP-Zugangsdaten unvollständig.")
+        return None
+
+    try:
+        mail = imaplib.IMAP4_SSL(host=server, port=port, timeout=IMAP_TIMEOUT)
+        mail.login(username, password)
+
+        status, _ = mail.select(f'"{folder}"', readonly=True)
+        if status != "OK":
+            log.error(f"IMAP SELECT fehlgeschlagen: {folder!r}")
+            mail.logout()
+            return None
+
+        # ── Alle UNSEEN-UIDs holen ─────────────────────────────────────
+        status, data = mail.uid("SEARCH", None, "UNSEEN")
+        if status != "OK":
+            log.error("UID SEARCH UNSEEN fehlgeschlagen.")
+            mail.logout()
+            return None
+
+        raw = data[0].decode() if isinstance(data[0], bytes) else (data[0] or "")
+        unseen_uids = [int(u) for u in raw.split() if u.strip().isdigit()]
+
+        mail.logout()
+
+        total_unseen = len(unseen_uids)
+        max_uid      = max(unseen_uids) if unseen_uids else 0
+
+        log.info(
+            f"UNSEEN gesamt: {total_unseen}, "
+            f"höchste UID: {max_uid}"
+        )
+        return {
+            "unseen_uids":   unseen_uids,
+            "total_unseen":  total_unseen,
+            "max_uid":       max_uid,
+        }
+
+    except imaplib.IMAP4.error as e:
+        log.error(f"IMAP-Fehler: {e}")
+    except socket.timeout:
+        log.error(f"IMAP-Timeout nach {IMAP_TIMEOUT}s.")
+    except socket.gaierror as e:
+        log.error(f"DNS-Fehler für {server!r}: {e}")
+    except ConnectionRefusedError:
+        log.error(f"Verbindung zu {server}:{port} abgelehnt.")
+    except OSError as e:
+        log.error(f"Netzwerkfehler: {e}")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIL-CLIENT STARTEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def open_mail_client() -> None:
+    client_path = PasswordManager.load(KEYRING_KEY_MAILCLIENT)
+    if not client_path:
+        log.warning("Kein Mail-Client im Keyring konfiguriert.")
+        show_error_dialog(
+            "Kein Mail-Client konfiguriert.\n\n"
+            "Bitte unter Einstellungen → Mail-Client-Befehl eintragen.\n\n"
+            "Beispiel für Chrome-WebApp:\n"
+            "/opt/google/chrome/google-chrome "
+            "--profile-directory=Default "
+            "--app-id=iokmfmbcohpblmmofiolgddnohnlaonk"
+        )
+        return
+    try:
+        args = validate_mail_client(client_path)
+        subprocess.Popen(
+            args,
+            shell=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        log.info(f"Mail-Client gestartet: {args[0]}")
+    except ValueError as e:
+        log.error(f"Mail-Client-Fehler: {e}")
+        show_error_dialog(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HILFSFUNKTIONEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_error_dialog(message: str) -> None:
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.OK,
+        text="Mailnotifier — Fehler",
+    )
+    dialog.format_secondary_text(message)
+    dialog.run()
+    dialog.destroy()
+
+
+def set_autostart(enabled: bool) -> None:
+    AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if enabled:
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Mailnotifier\n"
+            "Exec=mailnotifier\n"
+            "Icon=mailnotifier\n"
+            "Hidden=false\n"
+            "NoDisplay=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+        AUTOSTART_FILE.write_text(content)
+        os.chmod(AUTOSTART_FILE, 0o644)
+        log.info("Autostart aktiviert.")
+    else:
+        if AUTOSTART_FILE.exists():
+            AUTOSTART_FILE.unlink()
+        log.info("Autostart deaktiviert.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EINSTELLUNGSDIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SettingsDialog(Gtk.Dialog):
+    def __init__(self, parent, config):
+        super().__init__(
+            title="Mailnotifier — Einstellungen",
+            transient_for=parent,
+        )
+        self.set_default_size(500, 520)
+        self.config = config
+
+        self.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_SAVE,   Gtk.ResponseType.OK,
+        )
+
+        box  = self.get_content_area()
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)
+        box.add(grid)
+
+        def add_row(label_text, widget, row):
+            label = Gtk.Label(label=label_text, xalign=0)
+            label.set_width_chars(18)
+            grid.attach(label,  0, row, 1, 1)
+            widget.set_hexpand(True)
+            grid.attach(widget, 1, row, 1, 1)
+
+        cfg = config["IMAP"]
+
+        self.entry_server   = Gtk.Entry(text=cfg.get("server",         ""))
+        self.entry_port     = Gtk.Entry(text=cfg.get("port",           "993"))
+        self.entry_user     = Gtk.Entry(text=cfg.get("username",       ""))
+        self.entry_password = Gtk.Entry(text="", visibility=False)
+        self.entry_folder   = Gtk.Entry(text=cfg.get("folder",         "INBOX"))
+        self.entry_interval = Gtk.Entry(text=cfg.get("check_interval", "5"))
+        self.entry_client   = Gtk.Entry(text="")
+        self.chk_autostart  = Gtk.CheckButton(label="Autostart aktivieren")
+        self.chk_autostart.set_active(cfg.getboolean("autostart", True))
+
+        self.entry_server.set_placeholder_text("z.B. mail.example.com")
+        self.entry_password.set_placeholder_text(
+            "Wird sicher im GNOME Keyring gespeichert"
+        )
+        self.entry_client.set_placeholder_text(
+            "/opt/google/chrome/google-chrome --app-id=..."
+        )
+
+        stored_pw     = PasswordManager.load(KEYRING_KEY_PASSWORD)
+        stored_client = PasswordManager.load(KEYRING_KEY_MAILCLIENT)
+
+        if stored_pw:
+            self.entry_password.set_text(stored_pw)
+        if stored_client:
+            self.entry_client.set_text(stored_client)
+
+        add_row("IMAP-Server:",        self.entry_server,   0)
+        add_row("Port:",               self.entry_port,     1)
+        add_row("Benutzername:",       self.entry_user,     2)
+        add_row("Passwort:",           self.entry_password, 3)
+        add_row("Ordner:",             self.entry_folder,   4)
+        add_row("Intervall (Min.):",   self.entry_interval, 5)
+        add_row("Mail-Client-Befehl:", self.entry_client,   6)
+
+        grid.attach(self.chk_autostart, 0, 7, 2, 1)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_markup(
+            '<span size="small" foreground="#888888">'
+            "🔒 Passwort und Mail-Client-Pfad werden sicher im GNOME Keyring gespeichert —\n"
+            "    niemals im Klartext auf der Festplatte."
+            "</span>"
+        )
+        grid.attach(hint, 0, 8, 2, 1)
         self.show_all()
 
-    def _on_browse_client(self, _):
-        dlg = Gtk.FileChooserDialog(
-            title="Mail-Programm auswählen",
-            parent=self,
-            action=Gtk.FileChooserAction.OPEN
-        )
-        dlg.add_buttons("Abbrechen", Gtk.ResponseType.CANCEL,
-                         "Auswählen",  Gtk.ResponseType.OK)
-        dlg.set_current_folder("/usr/bin")
-        if dlg.run() == Gtk.ResponseType.OK:
-            self.e_client.set_text(dlg.get_filename())
-        dlg.destroy()
+    def get_values(self) -> dict | None:
+        server    = self.entry_server.get_text().strip()
+        port_str  = self.entry_port.get_text().strip()
+        username  = self.entry_user.get_text().strip()
+        password  = self.entry_password.get_text()
+        folder    = self.entry_folder.get_text().strip()
+        interval  = self.entry_interval.get_text().strip()
+        client    = self.entry_client.get_text().strip()
+        autostart = self.chk_autostart.get_active()
 
-    def _on_test_connection(self, _):
-        server   = self.e_server.get_text().strip()
-        port     = int(self.e_port.get_text().strip() or "993")
-        user     = self.e_user.get_text().strip()
-        password = self.e_pass.get_text()
-        use_ssl  = self.chk_ssl.get_active()
+        errors = []
 
-        if not server or not user or not password:
-            self._msg("Fehler", "Bitte alle IMAP-Felder ausfüllen.",
-                      Gtk.MessageType.ERROR)
-            return
+        if not validate_hostname(server):
+            errors.append(f"Ungültiger IMAP-Server: '{server}'")
 
-        def do_test():
+        try:
+            port = validate_port(port_str)
+        except ValueError as e:
+            errors.append(str(e))
+            port = 993
+
+        if not validate_folder(folder):
+            errors.append(f"Ungültiger Ordnername: '{folder}'")
+
+        try:
+            interval_int = int(interval)
+            if not (1 <= interval_int <= 1440):
+                raise ValueError()
+        except ValueError:
+            errors.append("Intervall muss eine Zahl zwischen 1 und 1440 sein.")
+            interval_int = 5
+
+        if client:
             try:
-                conn = (imaplib.IMAP4_SSL(server, port)
-                        if use_ssl else imaplib.IMAP4(server, port))
-                conn.login(user, password)
-                conn.select("INBOX", readonly=True)
-                _, data = conn.uid("search", None, "ALL")
-                count = len(data[0].split()) if data[0] else 0
-                conn.logout()
-                GLib.idle_add(self._msg,
-                    "Verbindung erfolgreich",
-                    f"✅ Verbunden!\n{count} Mails in INBOX.",
-                    Gtk.MessageType.INFO)
-            except Exception as e:
-                GLib.idle_add(self._msg,
-                    "Verbindungsfehler",
-                    f"❌ Fehler:\n{e}",
-                    Gtk.MessageType.ERROR)
+                validate_mail_client(client)
+            except ValueError as e:
+                errors.append(str(e))
 
-        threading.Thread(target=do_test, daemon=True).start()
+        if errors:
+            show_error_dialog("\n\n".join(errors))
+            return None
 
-    def _msg(self, title, body, mtype=Gtk.MessageType.INFO):
-        d = Gtk.MessageDialog(transient_for=self, flags=0,
-                              message_type=mtype,
-                              buttons=Gtk.ButtonsType.OK, text=title)
-        d.format_secondary_text(body)
-        d.run(); d.destroy()
+        return {
+            "server":         server,
+            "port":           str(port),
+            "username":       username,
+            "password":       password,
+            "folder":         folder,
+            "check_interval": str(interval_int),
+            "mail_client":    client,
+            "autostart":      str(autostart).lower(),
+        }
 
-    def save_to_config(self):
-        self.config.set("imap_server",   self.e_server.get_text().strip())
-        self.config.set("imap_port",     self.e_port.get_text().strip())
-        self.config.set("imap_user",     self.e_user.get_text().strip())
-        self.config.set("imap_password", self.e_pass.get_text())
-        self.config.set("imap_ssl",      str(self.chk_ssl.get_active()).lower())
-        self.config.set("imap_folder",   self.e_folder.get_text().strip() or "INBOX")
-        self.config.set("interval",      str(int(self.e_interval.get_value())))
-        self.config.set("mail_client",   self.e_client.get_text().strip())
-        self.config.set("autostart",     str(self.chk_autostart.get_active()).lower())
-        self.config.save()
 
-        if self.chk_autostart.get_active():
-            enable_autostart()
-        else:
-            disable_autostart()
+# ══════════════════════════════════════════════════════════════════════════════
+# HAUPT-APPLIKATION
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ──────────────────────────────────────────────
-# Hauptanwendung  ← KERN DER ÄNDERUNG
-# ──────────────────────────────────────────────
-class MailNotifierApp:
+class MailNotifier:
     def __init__(self):
-        self.config       = Config()
-        self.checker      = IMAPChecker(self.config)
-        self.has_new_mail = False
-        self._timer_id    = None
+        ensure_config_dir()
+        self.config          = load_config()
+        self.new_mail        = False
+        self._timer_id       = None
+        self._last_known_uid = None   # None = noch kein Check gelaufen
+                                      # 0    = Postfach war beim ersten Check leer
 
-        Notify.init(APP_NAME)
-
-        # ── Gtk.StatusIcon statt AppIndicator3 ──────────────────────────────
-        # StatusIcon trennt Linksklick (activate) und Rechtsklick (popup-menu)
-        # sauber auf Signalebene – perfekt für Linux Mint / Cinnamon.
-        # ────────────────────────────────────────────────────────────────────
         self.tray = Gtk.StatusIcon()
         self.tray.set_from_file(ICON_GREY)
-        self.tray.set_tooltip_text(APP_NAME)
-        self.tray.set_visible(True)
-
-        # LINKSKLICK  → Mail-Client öffnen + Icon zurücksetzen
-        self.tray.connect("activate", self._on_left_click)
-
-        # RECHTSKLICK → Kontextmenü anzeigen
+        self.tray.set_tooltip_text("Mailnotifier — Keine neuen Mails")
+        self.tray.connect("activate",   self._on_left_click)
         self.tray.connect("popup-menu", self._on_right_click)
 
         self._schedule_check()
-        log.info(f"{APP_NAME} gestartet – Intervall: "
-                 f"{self.config.get('interval')} Min.")
+        log.info("Mailnotifier gestartet.")
 
-    # ── Icon-Zustand ─────────────────────────────────────────────────────
-    def _set_icon_blue(self):
-        self.tray.set_from_file(ICON_BLUE)
-        self.tray.set_tooltip_text(f"{APP_NAME} – Neue Mail(s)!")
+    # ── Icon ──────────────────────────────────────────────────────────────
 
-    def _set_icon_grey(self):
-        self.tray.set_from_file(ICON_GREY)
-        self.tray.set_tooltip_text(APP_NAME)
+    def _set_icon(self, has_mail: bool) -> None:
+        GLib.idle_add(self._update_icon_idle, has_mail)
 
-    # ── Linksklick ───────────────────────────────────────────────────────
-    def _on_left_click(self, _icon):
-        """Linksklick: Mail-Programm direkt starten, Icon → grau."""
-        client = self.config.get("mail_client")
-        if client:
-            try:
-                subprocess.Popen(client, shell=True)
-                log.info(f"Mail-Client gestartet: {client}")
-            except Exception as e:
-                log.error(f"Fehler beim Starten: {e}")
-                self._notify("Fehler", f"Konnte '{client}' nicht starten:\n{e}")
+    def _update_icon_idle(self, has_mail: bool) -> bool:
+        if has_mail:
+            self.tray.set_from_file(ICON_BLUE)
+            self.tray.set_tooltip_text("Mailnotifier — Neue Mails vorhanden! 📬")
         else:
-            self._notify(
-                "Kein Mail-Programm konfiguriert",
-                "Bitte in den Einstellungen (Rechtsklick) einen Pfad angeben."
+            self.tray.set_from_file(ICON_GREY)
+            self.tray.set_tooltip_text("Mailnotifier — Keine neuen Mails")
+        return False
+
+    # ── Desktop-Benachrichtigung ──────────────────────────────────────────
+
+    def _show_notification(self, new_count: int, total_unseen: int) -> None:
+        GLib.idle_add(self._notify_idle, new_count, total_unseen)
+
+    def _notify_idle(self, new_count: int, total_unseen: int) -> bool:
+        summary = (
+            "📬 1 neue Mail"
+            if new_count == 1
+            else f"📬 {new_count} neue Mails"
+        )
+        body = f"Insgesamt {total_unseen} ungelesene Mail(s) im Posteingang."
+        try:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "--urgency=normal",
+                    "--expire-time=8000",
+                    f"--icon={ICON_BLUE}",
+                    "--app-name=Mailnotifier",
+                    summary,
+                    body,
+                ],
+                shell=False,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            log.info(f"Popup: {new_count} neue, {total_unseen} ungelesen gesamt.")
+        except FileNotFoundError:
+            log.warning("notify-send nicht gefunden.")
+        except Exception as e:
+            log.error(f"Benachrichtigungs-Fehler: {e}")
+        return False
 
-        # Icon immer zurücksetzen, egal ob Client gefunden oder nicht
-        if self.has_new_mail:
-            self.has_new_mail = False
-            self._set_icon_grey()
+    # ── Mail-Check ────────────────────────────────────────────────────────
 
-    # ── Rechtsklick ──────────────────────────────────────────────────────
-    def _on_right_click(self, _icon, button, activate_time):
-        """Rechtsklick: Kontextmenü anzeigen."""
+    def _schedule_check(self) -> None:
+        try:
+            interval_min = int(self.config["IMAP"].get("check_interval", "5"))
+            interval_min = max(1, min(interval_min, 1440))
+        except ValueError:
+            interval_min = 5
+
+        interval_ms = interval_min * 60 * 1000
+        threading.Thread(target=self._do_check, daemon=True).start()
+        self._timer_id = GLib.timeout_add(interval_ms, self._check_and_reschedule)
+
+    def _check_and_reschedule(self) -> bool:
+        threading.Thread(target=self._do_check, daemon=True).start()
+        return True
+
+    def _do_check(self) -> None:
+        result = check_mail(self.config)
+
+        if result is None:
+            # Verbindungsfehler → Zustand nicht ändern
+            return
+
+        unseen_uids  = result["unseen_uids"]
+        total_unseen = result["total_unseen"]
+        max_uid      = result["max_uid"]
+
+        # ── Erster Check nach Programmstart ───────────────────────────────
+        if self._last_known_uid is None:
+            # Baseline setzen — KEIN Popup, KEIN Icon-Wechsel
+            # (Mails die schon vorher da waren zählen nicht als "neu")
+            self._last_known_uid = max_uid
+            log.info(
+                f"Erster Check — Baseline gesetzt: UID={max_uid}, "
+                f"{total_unseen} ungelesene Mail(s) ignoriert."
+            )
+            return
+
+        # ── Folge-Checks: nur UIDs > last_known_uid sind wirklich neu ─────
+        new_uids  = [uid for uid in unseen_uids if uid > self._last_known_uid]
+        new_count = len(new_uids)
+
+        if new_count > 0:
+            # Neue Mails seit letztem Check!
+            self._last_known_uid = max_uid   # Baseline auf neueste Mail heben
+            self.new_mail        = True
+            self._set_icon(True)
+            self._show_notification(new_count, total_unseen)
+            log.info(
+                f"{new_count} neue Mail(s) gefunden "
+                f"(UIDs: {new_uids}). Neue Baseline: {max_uid}."
+            )
+        else:
+            # Keine neuen Mails — aber prüfen ob Postfach geleert wurde
+            if total_unseen == 0 and self.new_mail:
+                self.new_mail = False
+                self._set_icon(False)
+                log.info("Postfach geleert — Icon zurückgesetzt.")
+            else:
+                log.info(
+                    f"Keine neuen Mails. "
+                    f"Ungelesen gesamt: {total_unseen}, Baseline UID: {self._last_known_uid}."
+                )
+
+    # ── Klick-Handler ─────────────────────────────────────────────────────
+
+    def _on_left_click(self, icon) -> None:
+        """
+        Mail-Client öffnen + Icon zurücksetzen.
+        last_known_uid wird NICHT zurückgesetzt — der Nutzer
+        hat die Mails gesehen, aber im IMAP könnten sie noch
+        als UNSEEN markiert sein bis er sie wirklich öffnet.
+        """
+        open_mail_client()
+        self.new_mail = False
+        self._set_icon(False)
+        log.info("Mail-Client geöffnet — Icon auf grau gesetzt.")
+
+    def _on_right_click(self, icon, button, activate_time) -> None:
         menu = Gtk.Menu()
 
-        # Kopfzeile (nicht klickbar) – zeigt Status
-        status_label = (
-            "📬  Neue Mails vorhanden" if self.has_new_mail
-            else "📭  Keine neuen Mails"
-        )
-        item_status = Gtk.MenuItem(label=status_label)
-        item_status.set_sensitive(False)          # nur zur Info
-        menu.append(item_status)
-
-        menu.append(Gtk.SeparatorMenuItem())
+        item_settings = Gtk.MenuItem(label="⚙  Einstellungen")
+        item_settings.connect("activate", self._open_settings)
+        menu.append(item_settings)
 
         item_check = Gtk.MenuItem(label="🔄  Jetzt prüfen")
-        item_check.connect("activate", lambda _: self._trigger_check())
+        item_check.connect(
+            "activate",
+            lambda _: threading.Thread(target=self._do_check, daemon=True).start()
+        )
         menu.append(item_check)
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        item_settings = Gtk.MenuItem(label="⚙  Einstellungen…")
-        item_settings.connect("activate", self._on_settings)
-        menu.append(item_settings)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
         item_quit = Gtk.MenuItem(label="✕  Beenden")
-        item_quit.connect("activate", self._on_quit)
+        item_quit.connect("activate", self._quit)
         menu.append(item_quit)
 
         menu.show_all()
-        menu.popup(None, None,
-                   Gtk.StatusIcon.position_menu,  # Menü am Icon ausrichten
-                   self.tray,
-                   button, activate_time)
+        menu.popup(None, None, None, None, button, activate_time)
 
-    # ── Einstellungen ────────────────────────────────────────────────────
-    def _on_settings(self, _):
-        dlg = SettingsDialog(self)
-        if dlg.run() == Gtk.ResponseType.OK:
-            dlg.save_to_config()
-            self._schedule_check(restart=True)
-            log.info("Einstellungen gespeichert & Timer neu gestartet")
-        dlg.destroy()
+    # ── Einstellungen ─────────────────────────────────────────────────────
 
-    # ── Beenden ──────────────────────────────────────────────────────────
-    def _on_quit(self, _):
-        log.info("Beende Anwendung")
-        Notify.uninit()
+    def _open_settings(self, _) -> None:
+        dialog   = SettingsDialog(None, self.config)
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            values = dialog.get_values()
+            if values is not None:
+                password    = values.pop("password",    "")
+                mail_client = values.pop("mail_client", "")
+
+                if password:
+                    try:
+                        PasswordManager.save(
+                            KEYRING_KEY_PASSWORD, password, "IMAP Password"
+                        )
+                    except Exception as e:
+                        show_error_dialog(
+                            f"Passwort konnte nicht gespeichert werden:\n{e}"
+                        )
+                if mail_client:
+                    try:
+                        PasswordManager.save(
+                            KEYRING_KEY_MAILCLIENT, mail_client, "Mail Client Command"
+                        )
+                    except Exception as e:
+                        show_error_dialog(
+                            f"Mail-Client-Pfad konnte nicht gespeichert werden:\n{e}"
+                        )
+
+                for key, val in values.items():
+                    self.config["IMAP"][key] = val
+
+                for sensitive in ("password", "mail_client"):
+                    if sensitive in self.config["IMAP"]:
+                        del self.config["IMAP"][sensitive]
+
+                save_config(self.config)
+                set_autostart(self.config["IMAP"].getboolean("autostart", True))
+
+                if self._timer_id is not None:
+                    GLib.source_remove(self._timer_id)
+
+                # Baseline zurücksetzen damit der nächste
+                # Check eine frische Baseline setzt
+                self._last_known_uid = None
+                self._schedule_check()
+
+        dialog.destroy()
+
+    def _quit(self, _) -> None:
+        log.info("Mailnotifier beendet.")
         Gtk.main_quit()
 
-    # ── Check-Timer ──────────────────────────────────────────────────────
-    def _schedule_check(self, restart=False):
-        if restart and self._timer_id:
-            GLib.source_remove(self._timer_id)
-            self._timer_id = None
-
-        # Sofort einmal prüfen
-        threading.Thread(target=self._do_check, daemon=True).start()
-
-        # Dann im eingestellten Intervall wiederholen
-        interval_ms    = self.config.interval_seconds * 1000
-        self._timer_id = GLib.timeout_add(interval_ms, self._timer_callback)
-
-    def _timer_callback(self):
-        threading.Thread(target=self._do_check, daemon=True).start()
-        return True  # True = Timeout wiederholen
-
-    def _trigger_check(self):
-        """Manuell aus dem Menü heraus anstoßen."""
-        threading.Thread(target=self._do_check, daemon=True).start()
-
-    def _do_check(self):
-        count = self.checker.check()
-        if count > 0:
-            GLib.idle_add(self._on_new_mail, count)
-
-    def _on_new_mail(self, count):
-        self.has_new_mail = True
-        self._set_icon_blue()
-        text = f"{count} neue Mail" if count == 1 else f"{count} neue Mails"
-        self._notify("📬 Neue Mail(s)!", text)
-
-    def _notify(self, title, body):
-        try:
-            n = Notify.Notification.new(title, body, ICON_BLUE)
-            n.show()
-        except Exception as e:
-            log.warning(f"Desktop-Benachrichtigung fehlgeschlagen: {e}")
-
-    def run(self):
+    def run(self) -> None:
         Gtk.main()
 
-# ──────────────────────────────────────────────
-# Entry Point
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    app = MailNotifierApp()
+    if not SECRETSTORAGE_AVAILABLE:
+        log.warning(
+            "WARNUNG: secretstorage nicht installiert!\n"
+            "Bitte installieren: sudo apt install python3-secretstorage"
+        )
+    app = MailNotifier()
     app.run()
