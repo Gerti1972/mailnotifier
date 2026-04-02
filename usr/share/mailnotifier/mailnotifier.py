@@ -19,7 +19,7 @@ import sys
 import logging
 from pathlib import Path
 
-# ── SecretService (GNOME Keyring) ────────────────────────────────────────────
+# ── SecretService (GNOME Keyring) ─────────────────────────────────────────────
 try:
     import secretstorage
     SECRETSTORAGE_AVAILABLE = True
@@ -218,6 +218,10 @@ def load_config() -> configparser.ConfigParser:
             "check_interval": "5",
             "autostart":      "true",
         }
+    if "STATE" not in config:
+        config["STATE"] = {
+            "last_known_uid": "0",
+        }
     return config
 
 
@@ -229,7 +233,7 @@ def save_config(config: configparser.ConfigParser) -> None:
     with open(CONFIG_FILE, "w") as f:
         config.write(f)
     os.chmod(CONFIG_FILE, 0o600)
-    log.info("Konfiguration gespeichert (ohne sensible Daten).")
+    log.info("Konfiguration gespeichert.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,9 +244,9 @@ def check_mail(config: configparser.ConfigParser) -> dict | None:
     """
     Verbindet sich per IMAP und gibt ein Dict zurück:
       {
-        "new_count":  int,   # Anzahl Mails mit UID > last_known_uid
-        "total_unseen": int, # Gesamtzahl ungelesener Mails
-        "max_uid":    int,   # Höchste UID im UNSEEN-Set (zum Speichern)
+        "unseen_uids":  list[int],  # Alle UIDs ungelesener Mails
+        "total_unseen": int,        # Gesamtzahl ungelesener Mails
+        "max_uid":      int,        # Höchste UID im UNSEEN-Set
       }
     Gibt None zurück bei Verbindungsfehlern.
     """
@@ -277,7 +281,7 @@ def check_mail(config: configparser.ConfigParser) -> dict | None:
             mail.logout()
             return None
 
-        # ── Alle UNSEEN-UIDs holen ─────────────────────────────────────
+        # Alle UNSEEN-UIDs holen
         status, data = mail.uid("SEARCH", None, "UNSEEN")
         if status != "OK":
             log.error("UID SEARCH UNSEEN fehlgeschlagen.")
@@ -293,13 +297,12 @@ def check_mail(config: configparser.ConfigParser) -> dict | None:
         max_uid      = max(unseen_uids) if unseen_uids else 0
 
         log.info(
-            f"UNSEEN gesamt: {total_unseen}, "
-            f"höchste UID: {max_uid}"
+            f"UNSEEN gesamt: {total_unseen}, höchste UID: {max_uid}"
         )
         return {
-            "unseen_uids":   unseen_uids,
-            "total_unseen":  total_unseen,
-            "max_uid":       max_uid,
+            "unseen_uids":  unseen_uids,
+            "total_unseen": total_unseen,
+            "max_uid":      max_uid,
         }
 
     except imaplib.IMAP4.error as e:
@@ -522,12 +525,24 @@ class SettingsDialog(Gtk.Dialog):
 class MailNotifier:
     def __init__(self):
         ensure_config_dir()
-        self.config          = load_config()
-        self.new_mail        = False
-        self._timer_id       = None
-        self._last_known_uid = None   # None = noch kein Check gelaufen
-                                      # 0    = Postfach war beim ersten Check leer
+        self.config    = load_config()
+        self.new_mail  = False
+        self._timer_id = None
 
+        # ── UID-Baseline aus persistentem Speicher laden ──────────────────
+        try:
+            stored_uid = int(self.config["STATE"].get("last_known_uid", "0"))
+        except ValueError:
+            stored_uid = 0
+
+        if stored_uid > 0:
+            self._last_known_uid = stored_uid
+            log.info(f"UID-Baseline aus Config geladen: {stored_uid}")
+        else:
+            self._last_known_uid = None
+            log.info("Keine gespeicherte UID — Baseline wird beim ersten Check gesetzt.")
+
+        # ── Tray-Icon ─────────────────────────────────────────────────────
         self.tray = Gtk.StatusIcon()
         self.tray.set_from_file(ICON_GREY)
         self.tray.set_tooltip_text("Mailnotifier — Keine neuen Mails")
@@ -614,52 +629,56 @@ class MailNotifier:
         total_unseen = result["total_unseen"]
         max_uid      = result["max_uid"]
 
-        # ── Erster Check nach Programmstart ───────────────────────────────
+        # ── Erster Check — Baseline setzen ───────────────────────────────
         if self._last_known_uid is None:
-            # Baseline setzen — KEIN Popup, KEIN Icon-Wechsel
-            # (Mails die schon vorher da waren zählen nicht als "neu")
             self._last_known_uid = max_uid
+            self._save_uid(max_uid)
             log.info(
                 f"Erster Check — Baseline gesetzt: UID={max_uid}, "
-                f"{total_unseen} ungelesene Mail(s) ignoriert."
+                f"{total_unseen} vorhandene ungelesene Mail(s) ignoriert."
             )
             return
 
-        # ── Folge-Checks: nur UIDs > last_known_uid sind wirklich neu ─────
+        # ── Folge-Checks: nur UIDs > last_known_uid sind wirklich neu ────
         new_uids  = [uid for uid in unseen_uids if uid > self._last_known_uid]
         new_count = len(new_uids)
 
         if new_count > 0:
-            # Neue Mails seit letztem Check!
-            self._last_known_uid = max_uid   # Baseline auf neueste Mail heben
-            self.new_mail        = True
+            self._last_known_uid = max_uid
+            self._save_uid(max_uid)
+            self.new_mail = True
             self._set_icon(True)
             self._show_notification(new_count, total_unseen)
             log.info(
-                f"{new_count} neue Mail(s) gefunden "
-                f"(UIDs: {new_uids}). Neue Baseline: {max_uid}."
+                f"{new_count} neue Mail(s) (UIDs: {new_uids}). "
+                f"Neue Baseline: {max_uid}."
             )
         else:
-            # Keine neuen Mails — aber prüfen ob Postfach geleert wurde
             if total_unseen == 0 and self.new_mail:
                 self.new_mail = False
                 self._set_icon(False)
                 log.info("Postfach geleert — Icon zurückgesetzt.")
             else:
                 log.info(
-                    f"Keine neuen Mails. "
-                    f"Ungelesen gesamt: {total_unseen}, Baseline UID: {self._last_known_uid}."
+                    f"Keine neuen Mails. Ungelesen: {total_unseen}, "
+                    f"Baseline UID: {self._last_known_uid}."
                 )
+
+    def _save_uid(self, uid: int) -> None:
+        """Speichert die aktuelle Baseline-UID persistent in der Config-Datei."""
+        try:
+            if "STATE" not in self.config:
+                self.config["STATE"] = {}
+            self.config["STATE"]["last_known_uid"] = str(uid)
+            save_config(self.config)
+            log.info(f"UID-Baseline gespeichert: {uid}")
+        except Exception as e:
+            log.error(f"Fehler beim Speichern der UID-Baseline: {e}")
 
     # ── Klick-Handler ─────────────────────────────────────────────────────
 
     def _on_left_click(self, icon) -> None:
-        """
-        Mail-Client öffnen + Icon zurücksetzen.
-        last_known_uid wird NICHT zurückgesetzt — der Nutzer
-        hat die Mails gesehen, aber im IMAP könnten sie noch
-        als UNSEEN markiert sein bis er sie wirklich öffnet.
-        """
+        """Mail-Client öffnen + Icon zurücksetzen."""
         open_mail_client()
         self.new_mail = False
         self._set_icon(False)
@@ -675,7 +694,9 @@ class MailNotifier:
         item_check = Gtk.MenuItem(label="🔄  Jetzt prüfen")
         item_check.connect(
             "activate",
-            lambda _: threading.Thread(target=self._do_check, daemon=True).start()
+            lambda _: threading.Thread(
+                target=self._do_check, daemon=True
+            ).start()
         )
         menu.append(item_check)
 
@@ -709,10 +730,12 @@ class MailNotifier:
                         show_error_dialog(
                             f"Passwort konnte nicht gespeichert werden:\n{e}"
                         )
+
                 if mail_client:
                     try:
                         PasswordManager.save(
-                            KEYRING_KEY_MAILCLIENT, mail_client, "Mail Client Command"
+                            KEYRING_KEY_MAILCLIENT, mail_client,
+                            "Mail Client Command"
                         )
                     except Exception as e:
                         show_error_dialog(
@@ -727,14 +750,16 @@ class MailNotifier:
                         del self.config["IMAP"][sensitive]
 
                 save_config(self.config)
-                set_autostart(self.config["IMAP"].getboolean("autostart", True))
+                set_autostart(
+                    self.config["IMAP"].getboolean("autostart", True)
+                )
 
                 if self._timer_id is not None:
                     GLib.source_remove(self._timer_id)
 
-                # Baseline zurücksetzen damit der nächste
-                # Check eine frische Baseline setzt
+                # Baseline zurücksetzen → nächster Check setzt neue Baseline
                 self._last_known_uid = None
+                self._save_uid(0)
                 self._schedule_check()
 
         dialog.destroy()
